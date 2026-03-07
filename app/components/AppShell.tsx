@@ -137,7 +137,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 V
               </div>
               <div className="overflow-hidden">
-                <p className="text-sm font-medium text-white truncate">Vitor</p>
+                <p className="text-sm font-medium text-white truncate">Gustavo</p>
                 <p className="text-xs text-[#94a3b8] truncate">Minha Conta</p>
               </div>
             </div>
