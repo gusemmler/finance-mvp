@@ -140,30 +140,55 @@ async function extrairTransacoesExtrato(
   buffer: Buffer,
   mimeType: string
 ): Promise<any[]> {
-  const base64 = buffer.toString("base64");
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    max_tokens: 2000,
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: PROMPT_EXTRATO },
-          {
-            type: "image_url",
-            image_url: {
-              url: `data:${mimeType};base64,${base64}`,
-              detail: "high",
-            },
-          },
-        ],
-      },
-    ],
-  });
+  try {
+    console.log("🔍 [EXTRATO] Iniciando extração com mimeType:", mimeType);
+    console.log("🔍 [EXTRATO] Tamanho do buffer:", buffer.length, "bytes");
 
-  const content = response.choices[0]?.message?.content ?? "[]";
-  const match = content.match(/\[[\s\S]*\]/);
-  return match ? JSON.parse(match[0]) : [];
+    const base64 = buffer.toString("base64");
+    console.log("🔍 [EXTRATO] Base64 gerado, primeiros 100 chars:", base64.substring(0, 100));
+
+    console.log("🔍 [EXTRATO] Chamando OpenAI Vision API...");
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o",
+      max_tokens: 4000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: PROMPT_EXTRATO },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:${mimeType};base64,${base64}`,
+                detail: "high",
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const content = response.choices[0]?.message?.content ?? "[]";
+    console.log("🔍 [EXTRATO] Resposta da Vision API:", content.substring(0, 500));
+
+    const match = content.match(/\[[\s\S]*\]/);
+    
+    if (!match) {
+      console.log("❌ [EXTRATO] Nenhum JSON array encontrado na resposta!");
+      console.log("❌ [EXTRATO] Conteúdo completo:", content);
+      return [];
+    }
+
+    const transacoes = JSON.parse(match[0]);
+    console.log("✅ [EXTRATO] Transações extraídas:", transacoes.length);
+    console.log("✅ [EXTRATO] Conteúdo:", JSON.stringify(transacoes, null, 2));
+
+    return transacoes;
+  } catch (error: any) {
+    console.error("❌ [EXTRATO] Erro ao extrair transações:", error.message);
+    console.error("❌ [EXTRATO] Stack completo:", error);
+    return [];
+  }
 }
 
 async function transcreverAudio(buffer: Buffer): Promise<string> {
@@ -207,8 +232,18 @@ async function salvarMultiplasTransacoes(dados: any[]): Promise<number> {
     pago: true,
   }));
 
+  console.log("💾 [SUPABASE] Tentando salvar", transacoes.length, "transações");
+  console.log("💾 [SUPABASE] Dados:", JSON.stringify(transacoes, null, 2));
+
   const { error } = await supabase.from("transacoes").insert(transacoes);
-  return error ? 0 : transacoes.length;
+  
+  if (error) {
+    console.error("❌ [SUPABASE] Erro ao salvar:", error);
+    return 0;
+  }
+
+  console.log("✅ [SUPABASE] Transações salvas com sucesso!");
+  return transacoes.length;
 }
 
 // ======================================================================
@@ -340,6 +375,9 @@ export async function POST(req: NextRequest) {
     // ── DOCUMENTO (PDF) ────────────────────────────────────────────
     if (message.document) {
       const mimeType = message.document.mime_type ?? "application/pdf";
+      console.log("📄 [DOCUMENTO] Arquivo recebido!");
+      console.log("📄 [DOCUMENTO] Nome:", message.document.file_name);
+      console.log("📄 [DOCUMENTO] MIME Type:", mimeType);
 
       if (
         mimeType === "application/pdf" ||
@@ -351,10 +389,17 @@ export async function POST(req: NextRequest) {
         );
 
         const docId = message.document.file_id;
+        console.log("📄 [DOCUMENTO] Iniciando download do arquivo...");
+        
         const buffer = await baixarArquivo(docId);
+        console.log("📄 [DOCUMENTO] Download concluído, tamanho:", buffer.length, "bytes");
+
+        console.log("📄 [DOCUMENTO] Chamando extrairTransacoesExtrato...");
         const transacoes = await extrairTransacoesExtrato(buffer, mimeType);
+        console.log("📄 [DOCUMENTO] Resposta de transações:", transacoes);
 
         if (!transacoes || transacoes.length === 0) {
+          console.log("❌ [DOCUMENTO] Nenhuma transação foi extraída");
           await enviarMensagem(
             chatId,
             "❌ Não consegui extrair transações. Verifique se o arquivo está claro."
@@ -362,7 +407,9 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: true });
         }
 
+        console.log("📄 [DOCUMENTO] Iniciando salvamento das transações...");
         const quantidadeSalva = await salvarMultiplasTransacoes(transacoes);
+        console.log("📄 [DOCUMENTO] Quantidade salva:", quantidadeSalva);
 
         if (quantidadeSalva > 0) {
           const totalValor = transacoes
@@ -426,7 +473,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ ok: true });
   } catch (error: any) {
-    console.error("Telegram webhook error:", error);
+    console.error("❌ [WEBHOOK] Erro geral:", error);
     return NextResponse.json({ ok: true });
   }
 }
