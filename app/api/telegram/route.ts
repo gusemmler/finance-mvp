@@ -38,6 +38,36 @@ Use a data de hoje se não for mencionada. Retorne SOMENTE o JSON.
 `;
 
 // ======================================================================
+// PROMPT PARA EXTRAÇÃO DE EXTRATOS/FATURAS (MÚLTIPLAS TRANSAÇÕES)
+// ======================================================================
+const PROMPT_EXTRATO = `
+Você é um assistente especializado em extrair transações financeiras de extratos bancários, 
+faturas de cartão de crédito e movimentações financeiras.
+
+Analise a imagem/PDF e extraia TODAS as transações visíveis.
+
+Retorne um JSON array com CADA transação no formato:
+[
+  {
+    "tipo": "despesa" ou "receita",
+    "descricao": "descrição da transação",
+    "valor": 0.00,
+    "data": "YYYY-MM-DD",
+    "categoria": "Alimentação|Transporte|Moradia|Saúde|Educação|Lazer|Roupas|Assinaturas|Salário|Outros",
+    "conta": "Nubank|Itaú|Bradesco|Conta Corrente|Dinheiro|Cartão de Crédito"
+  }
+]
+
+IMPORTANTE:
+- Extraia TODAS as transações visíveis
+- Mantenha valores positivos (não adicione sinal de menos)
+- Se for débito/despesa, coloque tipo como "despesa"
+- Se for crédito/receita, coloque tipo como "receita"
+- Use a data completa (DD/MM/YYYY → YYYY-MM-DD)
+- Retorne SOMENTE o JSON array, nada mais.
+`;
+
+// ======================================================================
 // HELPERS
 // ======================================================================
 async function enviarMensagem(chatId: number, texto: string) {
@@ -106,6 +136,36 @@ async function extrairDadosFoto(buffer: Buffer, mimeType: string): Promise<any> 
   return match ? JSON.parse(match[0]) : null;
 }
 
+async function extrairTransacoesExtrato(
+  buffer: Buffer,
+  mimeType: string
+): Promise<any[]> {
+  const base64 = buffer.toString("base64");
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    max_tokens: 2000,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: PROMPT_EXTRATO },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:${mimeType};base64,${base64}`,
+              detail: "high",
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const content = response.choices[0]?.message?.content ?? "[]";
+  const match = content.match(/\[[\s\S]*\]/);
+  return match ? JSON.parse(match[0]) : [];
+}
+
 async function transcreverAudio(buffer: Buffer): Promise<string> {
   const { toFile } = await import("openai");
   const file = await toFile(buffer, "audio.ogg", { type: "audio/ogg" });
@@ -120,17 +180,35 @@ async function transcreverAudio(buffer: Buffer): Promise<string> {
 async function salvarTransacao(dados: any): Promise<boolean> {
   const hoje = new Date().toISOString().split("T")[0];
   const { error } = await supabase.from("transacoes").insert({
-    id:        uuidv4(),
-    tipo:      dados.tipo ?? "despesa",
+    id: uuidv4(),
+    tipo: dados.tipo ?? "despesa",
     descricao: dados.descricao ?? "Lançamento via Telegram",
-    valor:     Number(dados.valor) || 0,
-    data:      dados.data === "hoje" ? hoje : (dados.data ?? hoje),
+    valor: Number(dados.valor) || 0,
+    data: dados.data === "hoje" ? hoje : (dados.data ?? hoje),
     categoria: dados.categoria ?? "Outros",
-    conta:     dados.conta ?? "Conta Corrente",
-    parcelas:  1,
-    pago:      true,
+    conta: dados.conta ?? "Conta Corrente",
+    parcelas: 1,
+    pago: true,
   });
   return !error;
+}
+
+async function salvarMultiplasTransacoes(dados: any[]): Promise<number> {
+  const hoje = new Date().toISOString().split("T")[0];
+  const transacoes = dados.map((d) => ({
+    id: uuidv4(),
+    tipo: d.tipo ?? "despesa",
+    descricao: d.descricao ?? "Importado de extrato",
+    valor: Number(d.valor) || 0,
+    data: d.data === "hoje" ? hoje : (d.data ?? hoje),
+    categoria: d.categoria ?? "Outros",
+    conta: d.conta ?? "Conta Corrente",
+    parcelas: 1,
+    pago: true,
+  }));
+
+  const { error } = await supabase.from("transacoes").insert(transacoes);
+  return error ? 0 : transacoes.length;
 }
 
 // ======================================================================
@@ -152,13 +230,15 @@ export async function POST(req: NextRequest) {
 
       // Comando /start
       if (texto === "/start") {
-        await enviarMensagem(chatId,
+        await enviarMensagem(
+          chatId,
           `👋 Olá, *${nome}*! Sou seu assistente financeiro.\n\n` +
-          `📝 Me mande uma mensagem como:\n` +
-          `_"gastei 50 reais no mercado"_\n\n` +
-          `📷 Ou envie a *foto de uma nota fiscal*\n\n` +
-          `🎤 Ou mande um *áudio* descrevendo o gasto\n\n` +
-          `E eu registro automaticamente! 🚀`
+            `📝 Me mande uma mensagem como:\n` +
+            `_"gastei 50 reais no mercado"_\n\n` +
+            `📷 Ou envie a *foto de uma nota fiscal*\n\n` +
+            `📊 Ou use */extrato* para importar extrato bancário/fatura\n\n` +
+            `🎤 Ou mande um *áudio* descrevendo o gasto\n\n` +
+            `E eu registro automaticamente! 🚀`
         );
         return NextResponse.json({ ok: true });
       }
@@ -177,11 +257,25 @@ export async function POST(req: NextRequest) {
           .filter((t) => t.tipo === "despesa" && t.pago)
           .reduce((acc, t) => acc + Number(t.valor), 0);
 
-        await enviarMensagem(chatId,
+        await enviarMensagem(
+          chatId,
           `💰 *Resumo Financeiro*\n\n` +
-          `📈 Receitas: R$ ${receitas.toFixed(2)}\n` +
-          `📉 Despesas: R$ ${despesas.toFixed(2)}\n` +
-          `💵 Saldo: R$ ${(receitas - despesas).toFixed(2)}`
+            `📈 Receitas: R$ ${receitas.toFixed(2)}\n` +
+            `📉 Despesas: R$ ${despesas.toFixed(2)}\n` +
+            `💵 Saldo: R$ ${(receitas - despesas).toFixed(2)}`
+        );
+        return NextResponse.json({ ok: true });
+      }
+
+      // Comando /extrato
+      if (texto === "/extrato") {
+        await enviarMensagem(
+          chatId,
+          `📊 *Importar Extrato*\n\n` +
+            `Envie um arquivo de:\n` +
+            `✅ Extrato bancário (PDF ou screenshot)\n` +
+            `✅ Fatura de cartão de crédito (PDF ou screenshot)\n\n` +
+            `Vou extrair todas as transações e lançar automaticamente! 🚀`
         );
         return NextResponse.json({ ok: true });
       }
@@ -191,7 +285,8 @@ export async function POST(req: NextRequest) {
       const dados = await extrairDadosTexto(texto);
 
       if (!dados || !dados.valor) {
-        await enviarMensagem(chatId,
+        await enviarMensagem(
+          chatId,
           "❌ Não consegui entender. Tente:\n_\"gastei 45 no restaurante\"_"
         );
         return NextResponse.json({ ok: true });
@@ -199,13 +294,14 @@ export async function POST(req: NextRequest) {
 
       const ok = await salvarTransacao(dados);
       if (ok) {
-        await enviarMensagem(chatId,
+        await enviarMensagem(
+          chatId,
           `✅ *Registrado!*\n\n` +
-          `📝 ${dados.descricao}\n` +
-          `💰 R$ ${Number(dados.valor).toFixed(2)}\n` +
-          `🏷️ ${dados.categoria}\n` +
-          `💳 ${dados.conta}\n` +
-          `📅 ${dados.data === "hoje" ? new Date().toLocaleDateString("pt-BR") : dados.data}`
+            `📝 ${dados.descricao}\n` +
+            `💰 R$ ${Number(dados.valor).toFixed(2)}\n` +
+            `🏷️ ${dados.categoria}\n` +
+            `💳 ${dados.conta}\n` +
+            `📅 ${dados.data === "hoje" ? new Date().toLocaleDateString("pt-BR") : dados.data}`
         );
       } else {
         await enviarMensagem(chatId, "❌ Erro ao salvar. Tente novamente.");
@@ -221,18 +317,75 @@ export async function POST(req: NextRequest) {
       const dados = await extrairDadosFoto(buffer, "image/jpeg");
 
       if (!dados || !dados.valor) {
-        await enviarMensagem(chatId, "❌ Não consegui ler a nota. Tente uma foto mais nítida.");
+        await enviarMensagem(
+          chatId,
+          "❌ Não consegui ler a nota. Tente uma foto mais nítida."
+        );
         return NextResponse.json({ ok: true });
       }
 
       const ok = await salvarTransacao(dados);
       if (ok) {
-        await enviarMensagem(chatId,
+        await enviarMensagem(
+          chatId,
           `✅ *Nota registrada!*\n\n` +
-          `📝 ${dados.descricao}\n` +
-          `💰 R$ ${Number(dados.valor).toFixed(2)}\n` +
-          `🏷️ ${dados.categoria}\n` +
-          `💳 ${dados.conta}`
+            `📝 ${dados.descricao}\n` +
+            `💰 R$ ${Number(dados.valor).toFixed(2)}\n` +
+            `🏷️ ${dados.categoria}\n` +
+            `💳 ${dados.conta}`
+        );
+      }
+    }
+
+    // ── DOCUMENTO (PDF) ────────────────────────────────────────────
+    if (message.document) {
+      const mimeType = message.document.mime_type ?? "application/pdf";
+
+      if (
+        mimeType === "application/pdf" ||
+        mimeType.startsWith("image/")
+      ) {
+        await enviarMensagem(
+          chatId,
+          "📊 Extraindo transações do extrato..."
+        );
+
+        const docId = message.document.file_id;
+        const buffer = await baixarArquivo(docId);
+        const transacoes = await extrairTransacoesExtrato(buffer, mimeType);
+
+        if (!transacoes || transacoes.length === 0) {
+          await enviarMensagem(
+            chatId,
+            "❌ Não consegui extrair transações. Verifique se o arquivo está claro."
+          );
+          return NextResponse.json({ ok: true });
+        }
+
+        const quantidadeSalva = await salvarMultiplasTransacoes(transacoes);
+
+        if (quantidadeSalva > 0) {
+          const totalValor = transacoes
+            .reduce((acc, t) => acc + Number(t.valor), 0)
+            .toFixed(2);
+
+          await enviarMensagem(
+            chatId,
+            `✅ *${quantidadeSalva} transações importadas!*\n\n` +
+              `💰 Valor total: R$ ${totalValor}\n` +
+              `📅 Data: ${new Date().toLocaleDateString("pt-BR")}\n\n` +
+              `Todas foram lançadas na sua carteira! 🚀`
+          );
+        } else {
+          await enviarMensagem(
+            chatId,
+            "❌ Erro ao salvar as transações. Tente novamente."
+          );
+        }
+      } else {
+        await enviarMensagem(
+          chatId,
+          "❌ Envie um PDF ou imagem de extrato bancário."
         );
       }
     }
@@ -245,27 +398,33 @@ export async function POST(req: NextRequest) {
       const buffer = await baixarArquivo(fileId);
       const transcricao = await transcreverAudio(buffer);
 
-      await enviarMensagem(chatId, `🗣️ Entendi: _"${transcricao}"_\n\nProcessando...`);
+      await enviarMensagem(
+        chatId,
+        `🗣️ Entendi: _"${transcricao}"_\n\nProcessando...`
+      );
 
       const dados = await extrairDadosTexto(transcricao);
       if (!dados || !dados.valor) {
-        await enviarMensagem(chatId, "❌ Não consegui identificar o valor. Tente novamente.");
+        await enviarMensagem(
+          chatId,
+          "❌ Não consegui identificar o valor. Tente novamente."
+        );
         return NextResponse.json({ ok: true });
       }
 
       const ok = await salvarTransacao(dados);
       if (ok) {
-        await enviarMensagem(chatId,
+        await enviarMensagem(
+          chatId,
           `✅ *Registrado por áudio!*\n\n` +
-          `📝 ${dados.descricao}\n` +
-          `💰 R$ ${Number(dados.valor).toFixed(2)}\n` +
-          `🏷️ ${dados.categoria}`
+            `📝 ${dados.descricao}\n` +
+            `💰 R$ ${Number(dados.valor).toFixed(2)}\n` +
+            `🏷️ ${dados.categoria}`
         );
       }
     }
 
     return NextResponse.json({ ok: true });
-
   } catch (error: any) {
     console.error("Telegram webhook error:", error);
     return NextResponse.json({ ok: true });
